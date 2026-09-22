@@ -290,6 +290,7 @@ def report(conf, state, days=None):
              odds(total, nd, 86400), odds(total, nd, 7 * 86400), odds(total, nd, 30.4375 * 86400), odds(total, nd, 365.25 * 86400)))
     L.append("")
     L.append("CLOSEST EVER")
+    L.append("  %-14s %10s   %12s   %-14s %s" % ("miner", "best share", "% of block", "1 in N", "when"))
     for name, ms in sorted(state["miners"].items()):
         at = ms.get("all_time")
         if at:
