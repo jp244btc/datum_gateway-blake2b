@@ -1,0 +1,7 @@
+[Unit]
+Description=Poll the DATUM Gateway's miners for best share difficulty and update the /best report
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/miner-best-share poll

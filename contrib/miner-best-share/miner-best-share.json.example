@@ -1,0 +1,15 @@
+{
+  "title": "Bitcoin (SHA256)",
+  "timezone": "UTC",
+  "datum_config": "/etc/datum/datum_gateway_config.json",
+  "discover": true,
+  "miners": [],
+  "miner_api_port": 4028,
+  "difficulty_cmd": ["bitcoin-cli", "getdifficulty"],
+  "difficulty_key": "",
+  "difficulty_divisor": 1,
+  "mempool_api": "",
+  "report_days": 30,
+  "state_dir": "/var/lib/miner-best-share",
+  "www_dir": ""
+}

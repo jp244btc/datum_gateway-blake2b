@@ -1,0 +1,15 @@
+{
+  "title": "BLAKE2b",
+  "timezone": "UTC",
+  "datum_config": "/etc/datum/datum_gateway_config.json",
+  "discover": true,
+  "miners": [],
+  "miner_api_port": 4028,
+  "difficulty_cmd": ["bitcoin-cli", "getblockchaininfo"],
+  "difficulty_key": "difficulty_blake2b",
+  "difficulty_divisor": 4294967296,
+  "mempool_api": "",
+  "report_days": 30,
+  "state_dir": "/var/lib/miner-best-share",
+  "www_dir": ""
+}

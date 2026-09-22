@@ -59,6 +59,7 @@ set(WEB_RESOURCES
 	www/config_noauth_top.html
 	www/config_restart.html
 	www/threads_top.html
+	www/best_top.html
 	www/foot.html
 	www/assets/post.js
 	www/assets/style.css

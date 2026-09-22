@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""miner-best-share — how close each miner has come to finding a block, per day.
+
+  miner-best-share poll            poll the gateway + every miner, update state, write the report
+  miner-best-share report [DAYS]   print the report (default: report_days from the config)
+
+Miners are discovered from the DATUM Gateway's client list: the stratum "Auth Username" becomes the
+miner's name and the client's address is polled over the cgminer/sgminer API (TCP 4028, "summary")
+for its "Best Share" (highest share difficulty since the mining process started) and 5-minute hashrate.
+Per local day the report records the best share that was NEWLY observed that day, the miner's 60-minute
+average hashrate, and the odds of finding at least one block per day/week/month/year at that hashrate.
+
+The report is written to <state_dir>/report.txt (rendered by the gateway's /best page when running the
+best-shares fork of DATUM) and, optionally, as index.html/report.txt under www_dir for a plain web server.
+
+Config: /etc/miner-best-share.json — see miner-best-share.json.example next to this script.
+"""
+import csv, hashlib, html, json, math, os, re, secrets, socket, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+CONF = "/etc/miner-best-share.json"
+DEFAULTS = {
+    "title": "Best shares",
+    "timezone": "UTC",
+    "gateway_url": "",                       # e.g. http://127.0.0.1:7152 ; derived from datum_config when empty
+    "datum_config": "/etc/datum/datum_gateway_config.json",
+    "admin_username": "admin",
+    "admin_password": "",                    # taken from datum_config api.admin_password when empty
+    "discover": True,
+    "miners": [],                            # optional static entries: {"name": "...", "host": "...", "port": 4028}
+    "miner_api_port": 4028,
+    "difficulty_cmd": ["bitcoin-cli", "getdifficulty"],
+    "difficulty_key": "",                    # key to read when the command prints JSON (e.g. difficulty_blake2b)
+    "difficulty_divisor": 1,                 # 4294967296 when the node reports hashes-per-block instead of difficulty
+    "mempool_api": "",                       # optional fallback, e.g. https://mempool.space/api
+    "report_days": 30,
+    "state_dir": "/var/lib/miner-best-share",
+    "www_dir": "",                           # e.g. /var/www/miner-best-share for an nginx/apache setup; "" = off
+}
+
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+
+
+# ---------------------------------------------------------------- gateway access (HTTP digest auth)
+
+def digest_get(url, user, password, timeout=10):
+    """GET url; on a 401 answer the HTTP digest challenge (MD5 or SHA-256, qop=auth) once."""
+    req = urllib.request.Request(url, headers={"User-Agent": "miner-best-share"})
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        if e.code != 401:
+            raise
+        challenge = e.headers.get("WWW-Authenticate", "")
+    if not challenge.lower().startswith("digest "):
+        raise RuntimeError("gateway did not offer digest auth: %r" % challenge[:80])
+    p = {k: (v1 if v1 != "" else v2) for k, v1, v2 in re.findall(r'(\w+)=(?:"([^"]*)"|([^\s,]+))', challenge[7:])}
+    algorithm = p.get("algorithm", "MD5")
+    H = hashlib.sha256 if algorithm.upper().startswith("SHA-256") else hashlib.md5
+    h = lambda s: H(s.encode()).hexdigest()
+    path = urllib.parse.urlsplit(url).path or "/"
+    qop = "auth" if "auth" in [q.strip() for q in p.get("qop", "").split(",")] else None
+    nc, cnonce = "00000001", secrets.token_hex(8)
+    ha1, ha2 = h("%s:%s:%s" % (user, p["realm"], password)), h("GET:" + path)
+    resp = h("%s:%s:%s:%s:%s:%s" % (ha1, p["nonce"], nc, cnonce, qop, ha2)) if qop else h("%s:%s:%s" % (ha1, p["nonce"], ha2))
+    auth = 'Digest username="%s", realm="%s", nonce="%s", uri="%s", response="%s", algorithm=%s' % (
+        user, p["realm"], p["nonce"], path, resp, algorithm)
+    if qop:
+        auth += ', qop=%s, nc=%s, cnonce="%s"' % (qop, nc, cnonce)
+    if p.get("opaque"):
+        auth += ', opaque="%s"' % p["opaque"]
+    req.add_header("Authorization", auth)
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def gateway_settings(conf):
+    """Resolve gateway URL + admin password (from the config, else from the DATUM config file)."""
+    url, password = conf.get("gateway_url", ""), conf.get("admin_password", "")
+    if (not url or not password) and conf.get("datum_config"):
+        d = load_json(conf["datum_config"], {}).get("api", {})
+        password = password or d.get("admin_password", "")
+        if not url:
+            host = d.get("listen_addr") or "127.0.0.1"
+            url = "http://%s:%s" % (host if host != "0.0.0.0" else "127.0.0.1", d.get("listen_port", 7152))
+    return url.rstrip("/"), conf.get("admin_username", "admin"), password
+
+
+def worker_name(auth_username):
+    """Stratum username -> miner name. 'payoutaddress.worker' (pool_pass_full_users setups) -> 'worker'."""
+    u = (auth_username or "").strip()
+    if "." in u:
+        head, tail = u.split(".", 1)
+        if len(head) >= 26 and tail:      # looks like <address>.<worker>
+            return tail
+    return u or "(no username)"
+
+
+def discover(conf):
+    """Return [{'name','host','auth_username'}] from the gateway: /api/clients (fork) or the /clients page (stock)."""
+    url, user, password = gateway_settings(conf)
+    if not url or not password:
+        raise RuntimeError("gateway_url/admin_password not configured (set datum_config or admin_password)")
+    try:
+        with digest_get(url + "/api/clients", user, password) as r:
+            rows = [(c.get("rem_host", ""), c.get("auth_username", "")) for c in json.load(r) if c.get("subscribed", True)]
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise
+        with digest_get(url + "/clients", user, password) as r:       # stock DATUM: scrape the HTML table
+            page = r.read().decode("utf-8", "replace")
+        rows = [(m.group(1), html.unescape(m.group(2)))
+                for m in re.finditer(r"<TR><TD>\d+/\d+</TD><TD>([^<]*)</TD><TD>(.*?)</TD>", page, re.S)]
+    out = []
+    for rem_host, auth in rows:
+        host = rem_host.strip()
+        if host.startswith("::ffff:"):
+            host = host[7:]
+        if host.startswith("[") and "]" in host:
+            host = host[1:host.index("]")]
+        out.append({"name": worker_name(auth), "host": host, "auth_username": auth})
+    return out
+
+
+# ---------------------------------------------------------------- miners (cgminer API) + difficulty
+
+def cgminer(host, port, cmd, timeout=5):
+    with socket.create_connection((host, port), timeout=timeout) as s:
+        s.sendall((cmd + "|").encode())
+        buf = b""
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    return buf.decode("utf-8", "replace")
+
+
+def field(text, name):
+    m = re.search(r"(?:^|[|,])" + re.escape(name) + r"=([0-9.]+)", text)
+    return float(m.group(1)) if m else None
+
+
+def network_difficulty(conf):
+    """Network difficulty in the same units as the miners' share difficulty (diff 1 = 2^32 hashes)."""
+    try:
+        out = subprocess.run(conf["difficulty_cmd"], capture_output=True, text=True, timeout=20)
+        if out.returncode == 0:
+            txt = out.stdout.strip()
+            val = float(json.loads(txt)[conf["difficulty_key"]]) if conf.get("difficulty_key") else float(txt)
+            return val / float(conf.get("difficulty_divisor") or 1)
+    except Exception:
+        pass
+    api = conf.get("mempool_api")
+    if api:
+        try:
+            h = urllib.request.urlopen(api + "/blocks/tip/hash", timeout=10).read().decode()
+            b = json.load(urllib.request.urlopen(api + "/block/" + h, timeout=10))
+            return float(b["difficulty"]) / float(conf.get("difficulty_divisor") or 1)
+        except Exception:
+            pass
+    return None
+
+
+# ---------------------------------------------------------------- formatting
+
+def si(n):
+    if n is None:
+        return "-"
+    for unit, div in (("T", 1e12), ("G", 1e9), ("M", 1e6), ("k", 1e3)):
+        if n >= div:
+            return "%.2f %s" % (n / div, unit)
+    return "%.0f" % n
+
+
+def pct(best, nd):
+    """best share as a percentage of the difficulty needed for a block, 2 significant digits."""
+    if not nd or not best:
+        return "-"
+    v = best / nd * 100.0
+    d = 2 if v >= 0.1 else int(-math.floor(math.log10(v))) + 1
+    return ("%." + str(d) + "f %%") % v
+
+
+def one_in(n):
+    return "1 in %.1f" % n if n < 10 else "1 in %s" % si(n)
+
+
+def hashrate_60m(ms, now_epoch, window=3600):
+    pts = [v for t, v in ms.get("samples", []) if now_epoch - t <= window]
+    return (sum(pts) / len(pts)) * 1e6 if pts else None   # samples are MH/s
+
+
+def odds(hps, nd, seconds):
+    """Chance of >=1 block in `seconds` at `hps` H/s: '1 in N' while rare, expected count once likely."""
+    if not hps or not nd:
+        return "-"
+    lam = hps * seconds / (nd * 2 ** 32)
+    if lam >= 1:
+        return "~%.1f blocks" % lam
+    p = 1.0 - math.exp(-lam)
+    return one_in(1.0 / p) if p > 0 else "-"
+
+
+# ---------------------------------------------------------------- poll / report
+
+def poll(conf, state):
+    tz = ZoneInfo(conf["timezone"])
+    now = datetime.now(tz)
+    today, hhmm = now.strftime("%Y-%m-%d"), now.strftime("%H:%M")
+    epoch = int(now.timestamp())
+    nd = network_difficulty(conf)
+    if nd:
+        state["network_difficulty"], state["network_difficulty_at"] = nd, now.isoformat(timespec="minutes")
+
+    targets = {}
+    if conf.get("discover", True):
+        try:
+            for d in discover(conf):
+                key = d["name"] if d["name"] not in targets or targets[d["name"]]["host"] == d["host"] else "%s@%s" % (d["name"], d["host"])
+                targets[key] = {"host": d["host"], "port": conf["miner_api_port"], "auth_username": d["auth_username"]}
+            state.pop("discover_error", None)
+        except Exception as e:
+            state["discover_error"] = "%s %s" % (now.strftime("%Y-%m-%d %H:%M"), e)
+    for m in conf.get("miners", []):
+        targets[m["name"]] = {"host": m["host"], "port": m.get("port", conf["miner_api_port"]), "static": True}
+    for name, ms in state["miners"].items():           # keep polling miners seen before (they may be between pools)
+        if name not in targets and ms.get("host"):
+            targets[name] = {"host": ms["host"], "port": ms.get("port", conf["miner_api_port"]), "remembered": True}
+
+    for name, t in targets.items():
+        ms = state["miners"].setdefault(name, {"days": {}, "all_time": None, "last_value": None, "last_elapsed": None})
+        ms["host"], ms["port"] = t["host"], t["port"]
+        if t.get("auth_username"):
+            ms["auth_username"] = t["auth_username"]
+        ms["connected"] = not t.get("remembered")
+        try:
+            text = cgminer(t["host"], t["port"], "summary")
+            best, elapsed = field(text, "Best Share"), field(text, "Elapsed")
+            mhs = field(text, "MHS 5m")
+            if mhs is None:
+                mhs = field(text, "MHS av")
+            if best is None:
+                raise ValueError("no 'Best Share' field in summary")
+        except Exception as e:
+            ms["last_error"] = "%s %s" % (now.strftime("%Y-%m-%d %H:%M"), e)
+            continue
+        ms.pop("last_error", None)
+        best = int(best)
+        restarted = ms["last_elapsed"] is not None and elapsed is not None and elapsed < ms["last_elapsed"]
+        new_event = ms["last_value"] is None or best > ms["last_value"] or (restarted and best != ms["last_value"])
+        if new_event:
+            day = ms["days"].setdefault(today, {"best": 0, "when": hhmm})
+            if best > day["best"]:
+                day.update(best=best, when=hhmm)
+            if not ms["all_time"] or best > ms["all_time"]["diff"]:
+                ms["all_time"] = {"diff": best, "date": today, "when": hhmm}
+        ms["last_value"], ms["last_elapsed"], ms["last_seen"] = best, elapsed, now.strftime("%Y-%m-%d %H:%M")
+        if mhs is not None:
+            ms["samples"] = [[t0, v] for t0, v in ms.get("samples", []) if epoch - t0 <= 86400] + [[epoch, mhs]]
+    state["last_poll"] = now.strftime("%Y-%m-%d %H:%M %Z")
+    return state
+
+
+def report(conf, state, days=None):
+    days = days or conf["report_days"]
+    nd = state.get("network_difficulty")
+    L = []
+    L.append("%s — best share difficulty per miner per day   (last poll %s)" % (conf["title"], state.get("last_poll", "-")))
+    L.append("")
+    L.append("Network difficulty to find a block: %s  (%s)" % (("{:,.0f}".format(nd) if nd else "-"), si(nd)))
+    L.append("A share at that difficulty would have been a block.  '% of block' = best share / network difficulty;"
+             "  '1 in N' = network difficulty / best share.")
+    L.append("")
+    L.append("HASHRATE AND ODDS OF FINDING A BLOCK   (hashrate = average of 5-min readings over the last 60 min)")
+    L.append("  %-14s %12s   %-14s %-14s %-14s %s" % ("miner", "hashrate", "per day", "per week", "per month", "per year"))
+    now_epoch, total = time.time(), 0.0
+    for name, ms in sorted(state["miners"].items()):
+        h = hashrate_60m(ms, now_epoch)
+        total += h or 0.0
+        L.append("  %-14s %12s   %-14s %-14s %-14s %s" % (name, (si(h) + "H/s") if h else "-",
+                 odds(h, nd, 86400), odds(h, nd, 7 * 86400), odds(h, nd, 30.4375 * 86400), odds(h, nd, 365.25 * 86400)))
+    L.append("  %-14s %12s   %-14s %-14s %-14s %s" % ("ALL MINERS", (si(total) + "H/s") if total else "-",
+             odds(total, nd, 86400), odds(total, nd, 7 * 86400), odds(total, nd, 30.4375 * 86400), odds(total, nd, 365.25 * 86400)))
+    L.append("")
+    L.append("CLOSEST EVER")
+    for name, ms in sorted(state["miners"].items()):
+        at = ms.get("all_time")
+        if at:
+            L.append("  %-14s %10s   %12s   %-14s on %s %s" % (name, si(at["diff"]), pct(at["diff"], nd), one_in(nd / at["diff"]) if nd else "-", at["date"], at["when"]))
+        if ms.get("last_error"):
+            L.append("  %-14s (unreachable: %s)" % (name, ms["last_error"]))
+    if state.get("discover_error"):
+        L.append("  (gateway client list unavailable: %s)" % state["discover_error"])
+    L.append("")
+    L.append("BY DAY")
+    L.append("  %-10s  %-14s %10s   %12s   %s" % ("date", "miner", "best share", "% of block", "1 in N of a block"))
+    for d in sorted({d for ms in state["miners"].values() for d in ms["days"]}, reverse=True)[:days]:
+        for name, ms in sorted(state["miners"].items()):
+            day = ms["days"].get(d)
+            if day:
+                L.append("  %-10s  %-14s %10s   %12s   %-14s (%s)" % (d, name, si(day["best"]), pct(day["best"], nd), one_in(nd / day["best"]) if nd else "-", day["when"]))
+    return "\n".join(L) + "\n"
+
+
+def write_outputs(conf, state):
+    text = report(conf, state)
+    sd = conf["state_dir"]
+    with open(sd + "/report.txt", "w") as f:
+        f.write(text)
+    nd = state.get("network_difficulty")
+    with open(sd + "/daily.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["date", "miner", "best_share", "time", "network_difficulty", "pct_of_block", "one_in_n"])
+        for name, ms in sorted(state["miners"].items()):
+            for d in sorted(ms["days"]):
+                day = ms["days"][d]
+                w.writerow([d, name, day["best"], day["when"], int(nd) if nd else "",
+                            ("%.3g" % (day["best"] / nd * 100)) if nd else "", int(nd / day["best"]) if nd else ""])
+    www = conf.get("www_dir")
+    if www:
+        os.makedirs(www, exist_ok=True)
+        with open(www + "/report.txt", "w") as f:
+            f.write(text)
+        with open(www + "/index.html", "w") as f:
+            f.write("<!doctype html><html><head><meta charset='utf-8'><meta http-equiv='refresh' content='300'>"
+                    "<title>" + html.escape(conf["title"]) + "</title>"
+                    "<style>body{background:#111;color:#ddd;font:14px/1.4 monospace;margin:2em}"
+                    "@media (prefers-color-scheme: light){body{background:#fff;color:#111}}a{color:#6cb6ff}</style>"
+                    "</head><body><p><a href='/'>&larr; DATUM dashboard</a></p><pre>" + html.escape(text) + "</pre></body></html>")
+
+
+def main():
+    user_conf = load_json(CONF, None)
+    if user_conf is None:
+        sys.exit("missing " + CONF + " (see miner-best-share.json.example)")
+    conf = {**DEFAULTS, **user_conf}
+    os.makedirs(conf["state_dir"], exist_ok=True)
+    state_path = conf["state_dir"] + "/state.json"
+    state = load_json(state_path, {"miners": {}})
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "report"
+    if cmd == "poll":
+        state = poll(conf, state)
+        with open(state_path + ".tmp", "w") as f:
+            json.dump(state, f, indent=1)
+        os.replace(state_path + ".tmp", state_path)
+        write_outputs(conf, state)
+    elif cmd == "report":
+        sys.stdout.write(report(conf, state, int(sys.argv[2]) if len(sys.argv) > 2 else None))
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main()

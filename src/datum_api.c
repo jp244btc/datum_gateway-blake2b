@@ -997,6 +997,131 @@ int datum_api_client_dashboard(struct MHD_Connection *connection) {
 	return datum_api_submit_uncached_response(connection, MHD_HTTP_OK, response);
 }
 
+// ---------------------------------------------------------------------------
+// /best : show the miner-best-share report (contrib/miner-best-share writes it)
+// ---------------------------------------------------------------------------
+static const char * const datum_api_best_missing_msg =
+	"No report yet.\n\n"
+	"This page shows the report written by contrib/miner-best-share: a small poller that records each\n"
+	"miner's best share difficulty per day, its hashrate, and the odds of finding a block.\n\n"
+	"Install it from the contrib/miner-best-share directory of the source tree (see its README), or point\n"
+	"api.best_report_path in the gateway config at the report.txt it writes.\n";
+
+int datum_api_best(struct MHD_Connection *connection) {
+	struct MHD_Response *response;
+	char *filedata = NULL;
+	size_t filesz = 0;
+	const char * const path = datum_config.api_best_report_path;
+
+	FILE * const f = path[0] ? fopen(path, "rb") : NULL;
+	if (f) {
+		if (fseek(f, 0, SEEK_END) == 0) {
+			const long l = ftell(f);
+			if (l > 0 && l <= (1024*1024)) {
+				filesz = (size_t)l;
+				rewind(f);
+				filedata = malloc(filesz + 1);
+				if (filedata && fread(filedata, 1, filesz, f) != filesz) {
+					free(filedata);
+					filedata = NULL;
+					filesz = 0;
+				}
+			}
+		}
+		fclose(f);
+	}
+
+	const char * const body = filedata ? filedata : datum_api_best_missing_msg;
+	const size_t body_len = filedata ? filesz : strlen(body);
+	const size_t max_sz = www_best_top_html_sz + www_foot_html_sz + (body_len * 6) + 1024;
+	char * const output = malloc(max_sz + 1);
+	if (!output) {
+		free(filedata);
+		return MHD_NO;
+	}
+	size_t sz = 0;
+	memcpy(&output[sz], www_best_top_html, www_best_top_html_sz);
+	sz += www_best_top_html_sz;
+	sz += snprintf(&output[sz], max_sz - sz, "<pre style=\"text-align:left;white-space:pre;overflow-x:auto;margin:0 10px\">");
+	sz += strncpy_html_escape(&output[sz], body, max_sz - sz - www_foot_html_sz - 512);
+	sz += snprintf(&output[sz], max_sz - sz, "</pre>");
+	if (!filedata) {
+		sz += snprintf(&output[sz], max_sz - sz, "<p class=\"table-footer\">api.best_report_path = ");
+		sz += strncpy_html_escape(&output[sz], path[0] ? path : "(empty)", max_sz - sz - www_foot_html_sz - 64);
+		sz += snprintf(&output[sz], max_sz - sz, "</p>");
+	}
+	memcpy(&output[sz], www_foot_html, www_foot_html_sz);
+	sz += www_foot_html_sz;
+	free(filedata);
+
+	response = MHD_create_response_from_buffer(sz, (void *)output, MHD_RESPMEM_MUST_FREE);
+	MHD_add_response_header(response, "Content-Type", "text/html");
+	return datum_api_submit_uncached_response(connection, MHD_HTTP_OK, response);
+}
+
+// ---------------------------------------------------------------------------
+// /api/clients : the stratum client list as JSON (same admin auth as /clients)
+// ---------------------------------------------------------------------------
+static struct MHD_Response *datum_api_create_response_authfail_json() {
+	const char * const msg = "{\"error\":\"authentication required\"}";
+	struct MHD_Response * const response = MHD_create_response_from_buffer(strlen(msg), (void *)msg, MHD_RESPMEM_PERSISTENT);
+	MHD_add_response_header(response, "Content-Type", "application/json");
+	return response;
+}
+
+static json_t *datum_api_json_string_safe(const char * const s) {
+	json_t * const j = json_string(s ? s : "");
+	return j ? j : json_string("");
+}
+
+int datum_api_clients_json(struct MHD_Connection *connection) {
+	if (!datum_api_check_admin_password_httponly(connection, datum_api_create_response_authfail_json)) {
+		return MHD_YES;
+	}
+
+	json_t * const arr = json_array();
+	if (!arr) return MHD_NO;
+	const uint64_t tsms = current_time_millis();
+	const int max_threads = global_stratum_app ? global_stratum_app->max_threads : 0;
+
+	for (int j = 0; j < max_threads; ++j) {
+		for (int ii = 0; ii < global_stratum_app->max_clients_thread; ii++) {
+			if (global_stratum_app->datum_threads[j].client_data[ii].fd <= 0) continue;
+			const T_DATUM_MINER_DATA * const m = (T_DATUM_MINER_DATA *)global_stratum_app->datum_threads[j].client_data[ii].app_client_data;
+
+			double hr = 0.0;
+			const unsigned char astat = m->stats.active_index ? 0 : 1; // inverted, as on the Clients page
+			if (m->subscribed && (m->stats.last_swap_ms > 0) && (m->stats.diff_accepted[astat] > 0)) {
+				hr = ((double)m->stats.diff_accepted[astat] / ((double)m->stats.last_swap_ms / 1000.0)) * 0.004294967296; // Th/s
+			}
+
+			json_t * const o = json_object();
+			json_object_set_new(o, "tid", json_integer(j));
+			json_object_set_new(o, "cid", json_integer(ii));
+			json_object_set_new(o, "rem_host", datum_api_json_string_safe(global_stratum_app->datum_threads[j].client_data[ii].rem_host));
+			json_object_set_new(o, "auth_username", datum_api_json_string_safe(m->last_auth_username));
+			json_object_set_new(o, "useragent", datum_api_json_string_safe(m->useragent));
+			json_object_set_new(o, "subscribed", json_boolean(m->subscribed));
+			json_object_set_new(o, "connected_seconds", json_real((double)(tsms - m->connect_tsms) / 1000.0));
+			json_object_set_new(o, "last_share_seconds", m->stats.last_share_tsms ? json_real((double)(tsms - m->stats.last_share_tsms) / 1000.0) : json_null());
+			json_object_set_new(o, "vdiff", json_integer((json_int_t)m->current_diff));
+			json_object_set_new(o, "diff_accepted", json_integer((json_int_t)m->share_diff_accepted));
+			json_object_set_new(o, "shares_accepted", json_integer((json_int_t)m->share_count_accepted));
+			json_object_set_new(o, "diff_rejected", json_integer((json_int_t)m->share_diff_rejected));
+			json_object_set_new(o, "shares_rejected", json_integer((json_int_t)m->share_count_rejected));
+			json_object_set_new(o, "hashrate_ths", json_real(hr));
+			json_array_append_new(arr, o);
+		}
+	}
+
+	char * const out = json_dumps(arr, JSON_COMPACT);
+	json_decref(arr);
+	if (!out) return MHD_NO;
+	struct MHD_Response * const response = MHD_create_response_from_buffer(strlen(out), (void *)out, MHD_RESPMEM_MUST_FREE);
+	MHD_add_response_header(response, "Content-Type", "application/json");
+	return datum_api_submit_uncached_response(connection, MHD_HTTP_OK, response);
+}
+
 size_t datum_api_fill_config_var(const char *var_start, const size_t var_name_len, char * const replacement, const size_t replacement_max_len, const T_DATUM_API_DASH_VARS * const vardata) {
 	const char *colon_pos = memchr(var_start, ':', var_name_len);
 	const char *var_start_2 = colon_pos ? &colon_pos[1] : var_start;
@@ -1809,12 +1934,22 @@ enum MHD_Result datum_api_answer(void *cls, struct MHD_Connection *connection, c
 		}
 		
 		case 'a': {
+			if (!strcmp(url, "/api/clients")) {
+				return datum_api_clients_json(connection);
+			}
 			if (!strcmp(url, "/assets/icons/datum_logo.svg")) {
 				return datum_api_asset(connection, "image/svg+xml", www_assets_icons_datum_logo_svg, www_assets_icons_datum_logo_svg_sz, www_assets_icons_datum_logo_svg_etag);
 			} else if (!strcmp(url, "/assets/icons/favicon.ico")) {
 				return datum_api_asset(connection, "image/x-icon", www_assets_icons_favicon_ico, www_assets_icons_favicon_ico_sz, www_assets_icons_favicon_ico_etag);
 			} else if (!strcmp(url, "/assets/style.css")) {
 				return datum_api_asset(connection, "text/css", www_assets_style_css, www_assets_style_css_sz, www_assets_style_css_etag);
+			}
+			break;
+		}
+		
+		case 'b': {
+			if (!strcmp(url, "/best")) {
+				return datum_api_best(connection);
 			}
 			break;
 		}

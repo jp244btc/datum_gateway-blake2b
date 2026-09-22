@@ -14,6 +14,20 @@ Currently the DATUM Gateway supports communication with mining hardware using th
 
 The DATUM Gateway only supports mining Bitcoin.  Modifying the code to support non-Bitcoin is not straightforward, as many optimizations and design considerations are tightly tied to Bitcoin-specific restraints for efficiency.
 
+## Best shares (this fork)
+
+This fork adds a **Best** page to the dashboard (`/best`) showing, per miner and per day, the best share
+difficulty each miner has produced, how far that is from a block, the miner's hashrate, and the odds of
+finding a block per day/week/month/year. The data is gathered by `contrib/miner-best-share`, a small
+poller that discovers miners from the gateway's client list (their stratum Auth Username is the miner
+name) and reads each miner's cgminer API. Two small gateway additions support it:
+
+* `GET /best` renders the poller's report (config `api.best_report_path`, default
+  `/var/lib/miner-best-share/report.txt`);
+* `GET /api/clients` returns the stratum client list as JSON (same admin password as the Clients page).
+
+See [contrib/miner-best-share/README.md](contrib/miner-best-share/README.md) for setup.
+
 ## DATUM Protocol
 The DATUM Gateway's communication with the mining pool is via the DATUM Protocol.  This is an encrypted communication link between the DATUM Gateway (client) and the DATUM server (pool side).
 

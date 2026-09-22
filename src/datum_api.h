@@ -59,4 +59,8 @@ typedef struct {
 int datum_api_init(void);
 size_t strncpy_html_escape(char *dest, const char *src, size_t n);
 
+struct MHD_Connection;
+int datum_api_best(struct MHD_Connection *connection);
+int datum_api_clients_json(struct MHD_Connection *connection);
+
 #endif
