@@ -29,7 +29,8 @@ DEFAULTS = {
     "admin_password": "",                    # taken from datum_config api.admin_password when empty
     "discover": True,
     "miners": [],                            # optional static entries: {"name": "...", "host": "...", "port": 4028}
-    "miner_api_port": 4028,
+    "miner_api_port": 4028,                  # first port to try
+    "miner_api_ports": [4028, 4029],         # tried in order for discovered miners (iBeLink uses 4029)
     "difficulty_cmd": ["bitcoin-cli", "getdifficulty"],
     "difficulty_key": "",                    # key to read when the command prints JSON (e.g. difficulty_blake2b)
     "difficulty_divisor": 1,                 # 4294967296 when the node reports hashes-per-block instead of difficulty
@@ -271,12 +272,23 @@ def poll(conf, state):
 
     for name, t in targets.items():
         ms = state["miners"].setdefault(name, {"days": {}, "all_time": None, "last_value": None, "last_elapsed": None})
-        ms["host"], ms["port"] = t["host"], t["port"]
+        ms["host"] = t["host"]
         if t.get("auth_username"):
             ms["auth_username"] = t["auth_username"]
         ms["connected"] = not t.get("remembered")
+        ports = [t["port"]] if t.get("static") else [ms.get("port"), t["port"]] + list(conf.get("miner_api_ports", []))
+        ports = [q for i, q in enumerate(ports) if q and q not in ports[:i]]
         try:
-            text = cgminer(t["host"], t["port"], "summary")
+            text, err = None, None
+            for port in ports:
+                try:
+                    text = cgminer(t["host"], port, "summary")
+                    ms["port"] = port
+                    break
+                except OSError as e:
+                    err = e
+            if text is None:
+                raise err or OSError("no API port answered")
             best, elapsed = field(text, "Best Share"), field(text, "Elapsed")
             mhs = field(text, "MHS 5m")
             if mhs is None:

@@ -69,7 +69,7 @@ of this DATUM fork, so `/best` on the dashboard shows it immediately. `daily.csv
 | `gateway_url` / `admin_password` | derived | set these instead if the DATUM config is elsewhere or unreadable |
 | `discover` | `true` | discover miners from the gateway's client list |
 | `miners` | `[]` | extra static miners: `{"name": "...", "host": "...", "port": 4028}` (e.g. behind NAT) |
-| `miner_api_port` | `4028` | cgminer API port |
+| `miner_api_port` / `miner_api_ports` | `4028` / `[4028, 4029]` | cgminer API ports to try, in order (iBeLink firmware listens on 4029); the port that answers is remembered per miner |
 | `difficulty_cmd` | `["bitcoin-cli", "getdifficulty"]` | command printing the network difficulty |
 | `difficulty_key` | `""` | if the command prints JSON, the key to read |
 | `difficulty_divisor` | `1` | divide the node's value to get share-difficulty units (see BLAKE2b below) |
