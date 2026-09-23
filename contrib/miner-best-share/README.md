@@ -75,6 +75,7 @@ of this DATUM fork, so `/best` on the dashboard shows it immediately. `daily.csv
 | `difficulty_divisor` | `1` | divide the node's value to get share-difficulty units (see BLAKE2b below) |
 | `mempool_api` | `""` | optional fallback such as `https://mempool.space/api` |
 | `report_days` | `30` | days shown in BY DAY |
+| `idle_hashrate_hps` | `1e9` | below this 60-min average a miner is shown as `0 H/s` with no odds (a stopped miner's API keeps answering) |
 | `state_dir` | `/var/lib/miner-best-share` | state.json, report.txt, daily.csv |
 | `www_dir` | `""` | also write `index.html` + `report.txt` here for a plain web server (see below) |
 

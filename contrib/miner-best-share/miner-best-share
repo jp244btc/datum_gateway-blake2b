@@ -35,6 +35,7 @@ DEFAULTS = {
     "difficulty_divisor": 1,                 # 4294967296 when the node reports hashes-per-block instead of difficulty
     "mempool_api": "",                       # optional fallback, e.g. https://mempool.space/api
     "report_days": 30,
+    "idle_hashrate_hps": 1e9,                # below this a miner counts as idle: shown as 0 H/s, no odds
     "state_dir": "/var/lib/miner-best-share",
     "www_dir": "",                           # e.g. /var/www/miner-best-share for an nginx/apache setup; "" = off
 }
@@ -283,8 +284,10 @@ def report(conf, state, days=None):
     now_epoch, total = time.time(), 0.0
     for name, ms in sorted(state["miners"].items()):
         h = hashrate_60m(ms, now_epoch)
+        if h is not None and h < float(conf["idle_hashrate_hps"]):
+            h = 0.0                                   # idle / not hashing: shown as 0, no odds
         total += h or 0.0
-        L.append("  %-14s %12s   %-14s %-14s %-14s %s" % (name, (si(h) + "H/s") if h else "-",
+        L.append("  %-14s %12s   %-14s %-14s %-14s %s" % (name, "-" if h is None else (si(h) + "H/s") if h else "0 H/s",
                  odds(h, nd, 86400), odds(h, nd, 7 * 86400), odds(h, nd, 30.4375 * 86400), odds(h, nd, 365.25 * 86400)))
     L.append("  %-14s %12s   %-14s %-14s %-14s %s" % ("ALL MINERS", (si(total) + "H/s") if total else "-",
              odds(total, nd, 86400), odds(total, nd, 7 * 86400), odds(total, nd, 30.4375 * 86400), odds(total, nd, 365.25 * 86400)))
