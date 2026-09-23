@@ -110,23 +110,33 @@ def discover(conf):
         raise RuntimeError("gateway_url/admin_password not configured (set datum_config or admin_password)")
     try:
         with digest_get(url + "/api/clients", user, password) as r:
-            rows = [(c.get("rem_host", ""), c.get("auth_username", "")) for c in json.load(r) if c.get("subscribed", True)]
+            rows = [(c.get("rem_host", ""), c.get("auth_username", ""), c.get("last_share_seconds"))
+                    for c in json.load(r) if c.get("subscribed", True)]
     except urllib.error.HTTPError as e:
         if e.code != 404:
             raise
         with digest_get(url + "/clients", user, password) as r:       # stock DATUM: scrape the HTML table
             page = r.read().decode("utf-8", "replace")
-        rows = [(m.group(1), html.unescape(m.group(2)))
-                for m in re.finditer(r"<TR><TD>\d+/\d+</TD><TD>([^<]*)</TD><TD>(.*?)</TD>", page, re.S)]
+        rows = []
+        for m in re.finditer(r"<TR><TD>\d+/\d+</TD><TD>([^<]*)</TD><TD>(.*?)</TD><TD>.*?</TD><TD>(.*?)</TD>", page, re.S):
+            age = re.search(r"([0-9.]+)s", m.group(3))              # "Last Accepted" column, e.g. 11.2s or N/A
+            rows.append((m.group(1), html.unescape(m.group(2)), float(age.group(1)) if age else None))
     out = []
-    for rem_host, auth in rows:
+    for rem_host, auth, age in rows:
         host = rem_host.strip()
         if host.startswith("::ffff:"):
             host = host[7:]
         if host.startswith("[") and "]" in host:
             host = host[1:host.index("]")]
-        out.append({"name": worker_name(auth), "host": host, "auth_username": auth})
-    return out
+        out.append({"name": worker_name(auth), "host": host, "auth_username": auth, "last_share_age": age})
+    # one miner per address: if several sessions come from the same host (e.g. backup pool slots with
+    # different worker names), keep the one that submitted a share most recently
+    by_host = {}
+    for d in out:
+        cur = by_host.get(d["host"])
+        if cur is None or (d["last_share_age"] is not None and (cur["last_share_age"] is None or d["last_share_age"] < cur["last_share_age"])):
+            by_host[d["host"]] = d
+    return list(by_host.values())
 
 
 # ---------------------------------------------------------------- miners (cgminer API) + difficulty
@@ -211,6 +221,25 @@ def odds(hps, nd, seconds):
 
 # ---------------------------------------------------------------- poll / report
 
+def merge_miner(miners, old_name, new_name):
+    """Fold miner `old_name`'s history into `new_name` (same machine, renamed) and drop the old entry."""
+    old = miners.pop(old_name)
+    new = miners.setdefault(new_name, {"days": {}, "all_time": None, "last_value": None, "last_elapsed": None})
+    for d, rec in old.get("days", {}).items():
+        if d not in new["days"] or rec["best"] > new["days"][d]["best"]:
+            new["days"][d] = rec
+    if old.get("all_time") and (not new.get("all_time") or old["all_time"]["diff"] > new["all_time"]["diff"]):
+        new["all_time"] = old["all_time"]
+    seen = {t for t, _ in new.get("samples", [])}
+    new["samples"] = sorted(new.get("samples", []) + [[t, v] for t, v in old.get("samples", []) if t not in seen])
+    if (old.get("last_seen") or "") > (new.get("last_seen") or ""):
+        for k in ("last_value", "last_elapsed", "last_seen"):
+            new[k] = old.get(k)
+    new.setdefault("former_names", [])
+    if old_name not in new["former_names"]:
+        new["former_names"].append(old_name)
+
+
 def poll(conf, state):
     tz = ZoneInfo(conf["timezone"])
     now = datetime.now(tz)
@@ -231,8 +260,13 @@ def poll(conf, state):
             state["discover_error"] = "%s %s" % (now.strftime("%Y-%m-%d %H:%M"), e)
     for m in conf.get("miners", []):
         targets[m["name"]] = {"host": m["host"], "port": m.get("port", conf["miner_api_port"]), "static": True}
+    # a miner that now reports a different username from the same address is the same machine:
+    # fold the old name's history into the new one so the record is continuous
+    claimed = {t["host"]: name for name, t in targets.items()}
+    for old_name in [n for n, ms in state["miners"].items() if n not in targets and ms.get("host") in claimed]:
+        merge_miner(state["miners"], old_name, claimed[state["miners"][old_name]["host"]])
     for name, ms in state["miners"].items():           # keep polling miners seen before (they may be between pools)
-        if name not in targets and ms.get("host"):
+        if name not in targets and ms.get("host") and ms["host"] not in claimed:
             targets[name] = {"host": ms["host"], "port": ms.get("port", conf["miner_api_port"]), "remembered": True}
 
     for name, t in targets.items():
