@@ -76,6 +76,7 @@ of this DATUM fork, so `/best` on the dashboard shows it immediately. `daily.csv
 | `mempool_api` | `""` | optional fallback such as `https://mempool.space/api` |
 | `report_days` | `30` | days shown in BY DAY |
 | `idle_hashrate_hps` | `1e9` | below this 60-min average a miner is shown as `0 H/s` with no odds (a stopped miner's API keeps answering) |
+| `stale_days` | `3` | a miner that has left the gateway and not answered its API for this long drops out of the live tables (its BY DAY history stays); `miner-best-share forget NAME` removes one entirely |
 | `state_dir` | `/var/lib/miner-best-share` | state.json, report.txt, daily.csv |
 | `www_dir` | `""` | also write `index.html` + `report.txt` here for a plain web server (see below) |
 

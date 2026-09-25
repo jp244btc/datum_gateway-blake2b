@@ -4,6 +4,7 @@
   miner-best-share poll            poll the gateway + every miner, update state, write the report
   miner-best-share report [DAYS]   print the report (default: report_days from the config)
   miner-best-share rename OLD NEW  rename a miner (merging into NEW if it exists); OLD is kept as an alias
+  miner-best-share forget NAME     drop a miner and its history from the state
 
 Miners are discovered from the DATUM Gateway's client list: the stratum "Auth Username" becomes the
 miner's name and the client's address is polled over the cgminer/sgminer API (TCP 4028, "summary")
@@ -39,6 +40,7 @@ DEFAULTS = {
     "mempool_api": "",                       # optional fallback, e.g. https://mempool.space/api
     "report_days": 30,
     "idle_hashrate_hps": 1e9,                # below this a miner counts as idle: shown as 0 H/s, no odds
+    "stale_days": 3,                         # a miner gone from the gateway and unreachable this long leaves the live tables
     "state_dir": "/var/lib/miner-best-share",
     "www_dir": "",                           # e.g. /var/www/miner-best-share for an nginx/apache setup; "" = off
 }
@@ -206,6 +208,18 @@ def one_in(n):
     return "1 in %.1f" % n if n < 10 else "1 in %s" % si(n)
 
 
+def is_stale(ms, conf):
+    """True when the miner is neither connected to the gateway nor answering its API for stale_days."""
+    if ms.get("connected") or not ms.get("last_error"):
+        return False
+    ok = ms.get("last_seen") or ms.get("first_seen") or ""
+    try:
+        last_ok = datetime.strptime(ok, "%Y-%m-%d %H:%M").replace(tzinfo=ZoneInfo(conf["timezone"]))
+    except ValueError:
+        return False
+    return (datetime.now(ZoneInfo(conf["timezone"])) - last_ok).total_seconds() > float(conf["stale_days"]) * 86400
+
+
 def hashrate_60m(ms, now_epoch, window=3600):
     pts = [v for t, v in ms.get("samples", []) if now_epoch - t <= window]
     return (sum(pts) / len(pts)) * 1e6 if pts else None   # samples are MH/s
@@ -345,7 +359,8 @@ def report(conf, state, days=None):
     L.append("HASHRATE AND ODDS OF FINDING A BLOCK   (hashrate = average of 5-min readings over the last 60 min)")
     L.append("  %-14s %12s   %-14s %-14s %-14s %s" % ("miner", "hashrate", "per day", "per week", "per month", "per year"))
     now_epoch, total = time.time(), 0.0
-    for name, ms in sorted(state["miners"].items()):
+    live = {n: ms for n, ms in state["miners"].items() if not is_stale(ms, conf)}
+    for name, ms in sorted(live.items()):
         h = hashrate_60m(ms, now_epoch)
         if h is not None and h < float(conf["idle_hashrate_hps"]):
             h = 0.0                                   # idle / not hashing: shown as 0, no odds
@@ -357,7 +372,7 @@ def report(conf, state, days=None):
     L.append("")
     L.append("CLOSEST EVER")
     L.append("  %-14s %10s   %12s   %-14s %s" % ("miner", "best share", "% of block", "1 in N", "when"))
-    for name, ms in sorted(state["miners"].items()):
+    for name, ms in sorted(live.items()):
         at = ms.get("all_time")
         if at:
             L.append("  %-14s %10s   %12s   %-14s on %s %s" % (name, si(at["diff"]), pct(at["diff"], nd), one_in(nd / at["diff"]) if nd else "-", at["date"], at["when"]))
@@ -420,6 +435,15 @@ def main():
         write_outputs(conf, state)
     elif cmd == "report":
         sys.stdout.write(report(conf, state, int(sys.argv[2]) if len(sys.argv) > 2 else None))
+    elif cmd == "forget" and len(sys.argv) == 3:
+        if sys.argv[2] not in state["miners"]:
+            sys.exit("no miner named %r (known: %s)" % (sys.argv[2], ", ".join(sorted(state["miners"]))))
+        del state["miners"][sys.argv[2]]
+        with open(state_path + ".tmp", "w") as f:
+            json.dump(state, f, indent=1)
+        os.replace(state_path + ".tmp", state_path)
+        write_outputs(conf, state)
+        print("forgot", sys.argv[2])
     elif cmd == "rename" and len(sys.argv) == 4:
         old_name, new_name = sys.argv[2], sys.argv[3]
         if old_name not in state["miners"]:
