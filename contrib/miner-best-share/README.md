@@ -80,7 +80,11 @@ of this DATUM fork, so `/best` on the dashboard shows it immediately. `daily.csv
 | `www_dir` | `""` | also write `index.html` + `report.txt` here for a plain web server (see below) |
 
 Miner names: the stratum username as sent by the miner. For `payoutaddress.worker` style usernames
-(pool_pass_full_users), only the `worker` part is used.
+(pool_pass_full_users), only the `worker` part is used. A miner keeps the name it was first recorded
+under: if the same address later shows up with another username (a backup pool slot with a different
+worker name, for instance) that username is stored as an alias instead of creating a second miner.
+To rename one on purpose use `miner-best-share rename OLD NEW`, or pin names per address with
+`"names": {"<address>": "<name>"}` in the config.
 
 ### BLAKE2b (Bitcoin Knots 29.4.x hard fork)
 
